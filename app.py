@@ -741,26 +741,34 @@ with tab_deep:
 
         st.divider()
 
-        # Risk-Per-Trade Position Sizer (Volatility-Adjusted)
-        st.subheader("🛡️ Risk-Per-Trade Position Sizer (ATR-Adjusted)")
+       # Risk-Per-Trade Position Sizer (Volatility & Allocation-Capped)
+        st.subheader("🛡️ Risk-Per-Trade Position Sizer (ATR & Cap-Adjusted)")
         st.caption(
             f"Sizes a hypothetical **{ticker}** entry using its live **-{sl_mult:g}x ATR stop (${sl_price:.2f})** "
-            "so one stop-out never exceeds your chosen max account risk."
+            "and a portfolio concentration cap so neither a normal stop-out nor an overnight gap hits too hard."
         )
 
-        sc1, sc2, sc3 = st.columns(3)
+        sc1, sc2, sc3, sc4 = st.columns([2, 2, 2, 1.3])
         account_size = sc1.number_input("Portfolio / Account Size ($)", min_value=100.0, value=5000.0, step=500.0)
         risk_pct = sc2.slider("Max Risk per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
-        allow_fractional = sc3.checkbox("Allow Fractional Shares", value=False)
+        max_alloc_pct = sc3.slider(
+            "Max Allocation Cap (%)",
+            min_value=5, max_value=50, value=20, step=5,
+            help="Caps any single position at this % of your account to guard against overnight gap risk."
+        )
+        allow_fractional = sc4.checkbox("Fractional Shares", value=False)
 
         risk_budget = account_size * (risk_pct / 100.0)
+        alloc_budget = account_size * (max_alloc_pct / 100.0)
         risk_per_share = latest_close - sl_price
         reward_per_share = tp_price - latest_close
 
         if risk_per_share > 0:
-            raw_shares = risk_budget / risk_per_share
-            max_cash_shares = account_size / latest_close
-            sized_shares = min(raw_shares, max_cash_shares)
+            raw_risk_shares = risk_budget / risk_per_share
+            max_alloc_shares = alloc_budget / latest_close
+            capped_by_alloc = max_alloc_shares < raw_risk_shares
+
+            sized_shares = min(raw_risk_shares, max_alloc_shares)
             if not allow_fractional:
                 sized_shares = float(int(np.floor(sized_shares)))
 
@@ -772,9 +780,10 @@ with tab_deep:
                 (hist_buy_ev_r * actual_risk_usd) if (hist_buy_ev_r is not None and actual_risk_usd > 0) else None
             )
 
+            cap_tag = f"Capped at {max_alloc_pct}%" if capped_by_alloc else f"{alloc_pct:.1f}% of acct"
             r1, r2, r3, r4 = st.columns(4)
             shares_disp = f"{sized_shares:.2f}" if allow_fractional else f"{int(sized_shares)}"
-            r1.metric("Max Position Size", f"{shares_disp} shares", f"${pos_cost:,.2f} ({alloc_pct:.1f}% of acct)", delta_color="off")
+            r1.metric("Max Position Size", f"{shares_disp} shares", f"${pos_cost:,.2f} ({cap_tag})", delta_color="off")
             r2.metric("Risk at Stop (-1R)", f"-${actual_risk_usd:,.2f}", f"Budget: ${risk_budget:,.2f} ({risk_pct:.1f}%)", delta_color="off")
             r3.metric(f"Gain at Target (+{rr_ratio:g}R)", f"+${target_gain_usd:,.2f}", f"Target: ${tp_price:.2f}", delta_color="off")
             r4.metric(
@@ -783,6 +792,12 @@ with tab_deep:
                 f"At ≥{confidence_threshold}% Purged Buy EV",
                 delta_color="off"
             )
+
+            if capped_by_alloc:
+                st.caption(
+                    f"ℹ️ **Allocation cap active:** ATR risk alone allowed {raw_risk_shares:.2f} shares, "
+                    f"but the **{max_alloc_pct}% portfolio cap (${alloc_budget:,.0f})** trimmed it to protect against overnight gaps."
+                )
 
             if signal != "BUY 🟢":
                 st.info(
