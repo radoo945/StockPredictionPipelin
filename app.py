@@ -9,7 +9,13 @@ from sklearn.metrics import accuracy_score, precision_score
 # 1. Page Setup
 st.set_page_config(page_title="Future Project: Quant Screener & ML", layout="wide")
 st.title("🚀 Future Project: Quant Screener & Decision Dashboard")
-st.caption("Macro-aware ML (QQQ/VIX), Triple-Barrier labeling, realistic fundamentals, and position recovery tracker.")
+st.caption("Macro-aware ML (QQQ/VIX), horizon-scaled Triple-Barrier EV, realistic fundamentals, and ATR position sizing.")
+
+HORIZON_CONFIG = {
+    "5 Trading Days (1 Week)": {"days": 5, "tp": 1.5, "sl": 1.0},
+    "10 Trading Days (2 Weeks)": {"days": 10, "tp": 2.25, "sl": 1.5},
+    "20 Trading Days (1 Month)": {"days": 20, "tp": 3.0, "sl": 2.0},
+}
 
 # Sidebar Controls
 with st.sidebar:
@@ -18,15 +24,15 @@ with st.sidebar:
 
     horizon_label = st.selectbox(
         "Triple-Barrier Horizon",
-        options=["10 Trading Days (2 Weeks)", "20 Trading Days (1 Month)", "5 Trading Days (1 Week)"],
-        index=1,
-        help="Target = hit +1.5x ATR profit target before -1.0x ATR stop-loss within this window."
+        options=list(HORIZON_CONFIG.keys()),
+        index=2,
+        help="Barriers scale with time while preserving a 1.5:1 Reward-to-Risk ratio (40% break-even win rate)."
     )
-    horizon_days = {
-        "5 Trading Days (1 Week)": 5,
-        "10 Trading Days (2 Weeks)": 10,
-        "20 Trading Days (1 Month)": 20,
-    }[horizon_label]
+    h_cfg = HORIZON_CONFIG[horizon_label]
+    horizon_days = h_cfg["days"]
+    tp_mult = h_cfg["tp"]
+    sl_mult = h_cfg["sl"]
+    rr_ratio = tp_mult / sl_mult  # 1.5
 
     model_choice = st.selectbox(
         "ML Algorithm",
@@ -54,11 +60,11 @@ with st.sidebar:
     st.divider()
     st.caption(
         "⚠️ Decision-support tool only—not financial advice. "
-        "Check Purged Accuracy, Buy Precision, and Trend Regime before acting."
+        "Verify Historical EV, Trend Regime, and Position Risk before acting."
     )
 
 
-# 2. Macro Market-Regime Pipeline (Cached once per hour for all tickers)
+# 2. Macro Market-Regime Pipeline (Cached once per hour)
 def _clean_yf(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -85,8 +91,8 @@ def load_macro_data() -> pd.DataFrame:
     return macro.dropna()
 
 
-def apply_triple_barrier(df: pd.DataFrame, horizon: int, tp_mult: float = 1.5, sl_mult: float = 1.0) -> pd.Series:
-    """Label 1 if +tp_mult*ATR is hit before -sl_mult*ATR (or closes green at timeout without stopping out)."""
+def apply_triple_barrier(df: pd.DataFrame, horizon: int, tp_m: float, sl_m: float) -> pd.Series:
+    """Label 1 if +tp_m*ATR is hit before -sl_m*ATR (or closes green at timeout without stopping out)."""
     closes = df["Close"].to_numpy()
     highs = df["High"].to_numpy()
     lows = df["Low"].to_numpy()
@@ -99,8 +105,8 @@ def apply_triple_barrier(df: pd.DataFrame, horizon: int, tp_mult: float = 1.5, s
         entry = closes[i]
         if np.isnan(atr) or atr <= 0 or np.isnan(entry):
             continue
-        upper = entry + tp_mult * atr
-        lower = entry - sl_mult * atr
+        upper = entry + tp_m * atr
+        lower = max(0.01, entry - sl_m * atr)
         hit = None
         for j in range(i + 1, i + 1 + horizon):
             hit_up = highs[j] >= upper
@@ -140,12 +146,17 @@ MACRO_FEATURES = ["Rel_Strength_20", "QQQ_Regime", "VIX_Level", "VIX_Chg_10"]
 
 
 @st.cache_data(ttl=3600)
-def load_market_data(symbol: str, shift_days: int = 20) -> tuple[pd.DataFrame, list[str]]:
+def load_market_data(
+    symbol: str,
+    shift_days: int = 20,
+    tp_m: float = 3.0,
+    sl_m: float = 2.0
+) -> tuple[pd.DataFrame, list[str]]:
     data = _clean_yf(yf.download(symbol, start="2021-01-01", multi_level_index=False, progress=False))
     if data.empty:
         return data, []
 
-    # Trend Indicators (SMA_200 kept for chart/regime only so recent IPOs don't lose 150 training days)
+    # Trend Indicators (SMA_200 kept for chart/regime only so recent IPOs preserve training rows)
     data["EMA_20"] = data["Close"].ewm(span=20, adjust=False).mean()
     data["SMA_50"] = data["Close"].rolling(window=50).mean()
     data["SMA_200"] = data["Close"].rolling(window=200, min_periods=200).mean()
@@ -206,8 +217,8 @@ def load_market_data(symbol: str, shift_days: int = 20) -> tuple[pd.DataFrame, l
         data["Rel_Strength_20"] = data["Ret_20"] - data["QQQ_Ret_20"]
         active_features += MACRO_FEATURES
 
-    # Triple-Barrier Target (last `shift_days` rows stay NaN so live row is preserved)
-    data["Target"] = apply_triple_barrier(data, horizon=shift_days, tp_mult=1.5, sl_mult=1.0)
+    # Horizon-Scaled Triple-Barrier Target
+    data["Target"] = apply_triple_barrier(data, horizon=shift_days, tp_m=tp_m, sl_m=sl_m)
     data.dropna(subset=active_features, inplace=True)
     return data, active_features
 
@@ -331,6 +342,10 @@ def fmt_money(val) -> str:
     return f"{sign}${abs_val:,.0f}"
 
 
+def calc_ev_r(win_prob: float, reward_risk: float = 1.5) -> float:
+    return (win_prob * reward_risk) - ((1.0 - win_prob) * 1.0)
+
+
 def make_model(choice: str):
     if choice.startswith("HistGradientBoosting"):
         return HistGradientBoostingClassifier(
@@ -354,7 +369,7 @@ def build_screener_table(tickers: tuple[str, ...]) -> pd.DataFrame:
     rows = []
     for sym in tickers:
         try:
-            df, _ = load_market_data(sym, shift_days=20)
+            df, _ = load_market_data(sym, shift_days=20, tp_m=3.0, sl_m=2.0)
             if df.empty or len(df) < 10:
                 continue
             f = load_fundamentals(sym)
@@ -364,6 +379,7 @@ def build_screener_table(tickers: tuple[str, ...]) -> pd.DataFrame:
             sma200 = float(df["SMA_200"].iloc[-1]) if pd.notna(df["SMA_200"].iloc[-1]) else np.nan
             rsi = float(df["RSI_14"].iloc[-1])
             dd = float(df["Drawdown_Pct"].iloc[-1])
+            atr_pct = float(df["ATR_Pct"].iloc[-1] * 100)
             rel_qqq = float(df["Rel_Strength_20"].iloc[-1] * 100) if "Rel_Strength_20" in df.columns else np.nan
             trend = classify_trend(close, sma50, sma200)
 
@@ -386,10 +402,10 @@ def build_screener_table(tickers: tuple[str, ...]) -> pd.DataFrame:
                 "Trend Regime": trend,
                 "vs SMA50 %": round(((close - sma50) / sma50) * 100, 1),
                 "vs QQQ 20D %": round(rel_qqq, 1) if pd.notna(rel_qqq) else np.nan,
+                "ATR %": round(atr_pct, 1),
                 "RSI (14)": round(rsi, 1),
                 "From 52W High %": round(dd, 1),
                 "Fund Score": f["fund_score"],
-                "P/S Ratio": round(f["ps_ratio"], 1) if f["ps_ratio"] else np.nan,
                 "Screener Verdict": verdict,
             })
         except Exception:
@@ -401,14 +417,14 @@ def build_screener_table(tickers: tuple[str, ...]) -> pd.DataFrame:
 tab_screener, tab_positions, tab_deep, tab_fund = st.tabs([
     "🔎 Stock Screener",
     "💼 My Positions & Break-Even",
-    "📈 Deep-Dive ML & Technicals",
+    "📈 Deep-Dive ML & Sizing",
     "💰 Live Financials & Runway"
 ])
 
 # --- TAB 1: STOCK SCREENER ---
 with tab_screener:
     st.subheader("Watchlist Stock Screener")
-    st.caption("Compare your holdings against peers and quality leaders using trend, QQQ relative strength, momentum, and fundamentals.")
+    st.caption("Compare your holdings against peers and quality leaders using trend, QQQ relative strength, ATR volatility, and fundamentals.")
 
     with st.spinner("Scanning watchlist..."):
         screen_df = build_screener_table(watchlist)
@@ -464,13 +480,14 @@ with tab_positions:
         if not sym or buy_p <= 0 or shares <= 0:
             continue
 
-        df_p, _ = load_market_data(sym, shift_days=20)
+        df_p, _ = load_market_data(sym, shift_days=20, tp_m=3.0, sl_m=2.0)
         if df_p.empty:
             continue
 
         curr_p = float(df_p["Close"].iloc[-1])
         sma50 = float(df_p["SMA_50"].iloc[-1])
         sma200 = float(df_p["SMA_200"].iloc[-1]) if pd.notna(df_p["SMA_200"].iloc[-1]) else np.nan
+        atr_p = float(df_p["ATR_14"].iloc[-1])
 
         cost = buy_p * shares
         val = curr_p * shares
@@ -478,6 +495,7 @@ with tab_positions:
         pnl_pct = ((curr_p - buy_p) / buy_p) * 100
         gain_to_even = max(0.0, ((buy_p - curr_p) / curr_p) * 100)
         dist_sma50 = ((sma50 - curr_p) / curr_p) * 100
+        trail_stop = max(0.01, curr_p - 2.0 * atr_p)
 
         total_cost += cost
         total_val += val
@@ -490,8 +508,9 @@ with tab_positions:
             "P&L ($)": round(pnl, 2),
             "P&L (%)": round(pnl_pct, 1),
             "% Gain to Break Even": round(gain_to_even, 1),
-            "SMA50 Reclaim Target ($)": round(sma50, 2),
-            "% to Reclaim SMA50": round(dist_sma50, 1),
+            "SMA50 Target ($)": round(sma50, 2),
+            "% to SMA50": round(dist_sma50, 1),
+            "2x ATR Floor ($)": round(trail_stop, 2),
             "Trend Regime": classify_trend(curr_p, sma50, sma200),
         })
 
@@ -505,17 +524,22 @@ with tab_positions:
         st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
 
 # --- LOAD DEEP-DIVE TICKER FOR TABS 3 & 4 ---
-data, active_features = load_market_data(ticker, shift_days=horizon_days) if ticker else (pd.DataFrame(), [])
+data, active_features = (
+    load_market_data(ticker, shift_days=horizon_days, tp_m=tp_mult, sl_m=sl_mult)
+    if ticker else (pd.DataFrame(), [])
+)
 fund = load_fundamentals(ticker) if ticker else {}
 
-# --- TAB 3: DEEP-DIVE ML & TECHNICALS ---
+# --- TAB 3: DEEP-DIVE ML, EV & POSITION SIZING ---
 with tab_deep:
     train_data = data.dropna(subset=["Target"]) if not data.empty else pd.DataFrame()
 
     if data.empty or len(train_data) < 60:
         st.error(f"Not enough historical price data for '{ticker}' (needs at least ~110 trading days).")
     else:
-        st.subheader(f"{fund['name']} ({ticker}) — {horizon_label} | {model_choice}")
+        st.subheader(
+            f"{fund['name']} ({ticker}) — {horizon_label} (+{tp_mult:g}x / -{sl_mult:g}x ATR) | {model_choice}"
+        )
 
         X_train = train_data[active_features]
         y_train = train_data["Target"].astype(int)
@@ -560,9 +584,15 @@ with tab_deep:
         latest_features = data[active_features].iloc[[-1]]
         probs = model.predict_proba(latest_features)[0]
         class_list = list(model.classes_)
-        prob_up = float(probs[class_list.index(1)] * 100) if 1 in class_list else 0.0
-        prob_down = float(probs[class_list.index(0)] * 100) if 0 in class_list else 0.0
+        prob_up_frac = float(probs[class_list.index(1)]) if 1 in class_list else 0.0
+        prob_down_frac = float(probs[class_list.index(0)]) if 0 in class_list else 0.0
+        prob_up = prob_up_frac * 100
+        prob_down = prob_down_frac * 100
         confidence = max(prob_up, prob_down)
+
+        # Expected Value (in R-multiples, where 1R = ATR stop distance, Win = +1.5R, Loss = -1.0R)
+        live_ev_r = calc_ev_r(prob_up_frac, rr_ratio)
+        hist_buy_ev_r = calc_ev_r(buy_prec, rr_ratio) if buy_calls > 0 else None
 
         latest_close = float(data["Close"].iloc[-1])
         prev_close = float(data["Close"].iloc[-2])
@@ -571,32 +601,40 @@ with tab_deep:
         sma200_now = float(data["SMA_200"].iloc[-1]) if pd.notna(data["SMA_200"].iloc[-1]) else np.nan
         trend_now = classify_trend(latest_close, sma50_now, sma200_now)
 
-        # Tightened Guardrails: 55% Purged Accuracy + 55% Directional Precision (min 3 signals) + Trend Alignment
-        MIN_EDGE = 0.55
-        MIN_CALLS = 3
+        # EV-Aware Guardrails:
+        # BUY requires Purged Acc >= 52%, Historical Buy EV >= +0.10R (Buy Prec >= 44%), min 5 calls, & non-Downtrend
+        # SELL requires Purged Acc >= 52%, Sell Prec >= 55%, & min 5 calls
+        MIN_ACC = 0.52
+        MIN_BUY_EV_R = 0.10
+        MIN_SELL_PREC = 0.55
+        MIN_CALLS = 5
         guardrail_reason = None
 
+        buy_ev_ok = (hist_buy_ev_r is not None) and (hist_buy_ev_r >= MIN_BUY_EV_R) and (buy_calls >= MIN_CALLS)
+        sell_ok = (sell_prec >= MIN_SELL_PREC) and (sell_calls >= MIN_CALLS)
+
         if prob_up >= confidence_threshold:
-            if mean_acc < MIN_EDGE or buy_prec < MIN_EDGE or buy_calls < MIN_CALLS:
+            if mean_acc < MIN_ACC or not buy_ev_ok:
                 signal = "⚠️ BLOCKED"
+                ev_str = f"{hist_buy_ev_r:+.2f}R" if hist_buy_ev_r is not None else "N/A"
                 guardrail_reason = (
-                    f"Raw model leaned BUY ({prob_up:.1f}%), but failed the 55% Triple-Barrier guardrail "
-                    f"(Purged Accuracy: **{mean_acc:.1%}**, Buy Precision: **{buy_prec:.1%}** across **{buy_calls}** historical calls)."
+                    f"Raw model leaned BUY ({prob_up:.1f}%), but failed the EV guardrail "
+                    f"(Purged Acc: **{mean_acc:.1%}**, Historical Buy EV: **{ev_str}** at **{buy_prec:.1%}** across **{buy_calls}** calls)."
                 )
             elif trend_now == "🔴 Downtrend":
                 signal = "⚠️ RISKY BUY"
                 guardrail_reason = (
-                    f"Model passed backtest checks ({buy_prec:.1%} Buy Prec), but **{ticker}** is still in a "
+                    f"Positive Historical Buy EV (**{hist_buy_ev_r:+.2f}R**), but **{ticker}** is still in a "
                     "**🔴 Downtrend** (Price < SMA_50 < SMA_200). Treat as a counter-trend bounce until SMA_50 is reclaimed."
                 )
             else:
                 signal = "BUY 🟢"
         elif prob_down >= confidence_threshold:
-            if mean_acc < MIN_EDGE or sell_prec < MIN_EDGE or sell_calls < MIN_CALLS:
+            if mean_acc < MIN_ACC or not sell_ok:
                 signal = "⚠️ BLOCKED"
                 guardrail_reason = (
-                    f"Raw model leaned SELL ({prob_down:.1f}%), but failed the 55% guardrail "
-                    f"(Purged Accuracy: **{mean_acc:.1%}**, Sell Precision: **{sell_prec:.1%}** across **{sell_calls}** historical calls)."
+                    f"Raw model leaned SELL ({prob_down:.1f}%), but failed the reliability floor "
+                    f"(Purged Acc: **{mean_acc:.1%}**, Sell Prec: **{sell_prec:.1%}** across **{sell_calls}** calls)."
                 )
             else:
                 signal = "SELL 🔴"
@@ -606,8 +644,12 @@ with tab_deep:
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Current Price", f"${latest_close:.2f}", f"{day_pct:+.2f}%")
         c2.metric("ML Signal", signal)
-        c3.metric("Model Confidence", f"{confidence:.1f}%", f"Win Prob: {prob_up:.1f}%")
-        c4.metric("Purged Accuracy", f"{mean_acc:.1%}", f"Buy: {buy_prec:.1%} | Sell: {sell_prec:.1%}")
+        c3.metric("Live EV (1.5:1 R:R)", f"{live_ev_r:+.2f}R", f"Win Prob: {prob_up:.1f}%")
+        c4.metric(
+            "Hist. Buy EV (Purged)",
+            f"{hist_buy_ev_r:+.2f}R" if hist_buy_ev_r is not None else "N/A",
+            f"Buy: {buy_prec:.1%} | Sell: {sell_prec:.1%}"
+        )
         c5.metric(
             "Fundamental Score",
             f"{fund['fund_score']}/100" if fund["fund_score"] is not None else "N/A",
@@ -615,13 +657,14 @@ with tab_deep:
         )
 
         # Guardrail & Dataset Diagnostic Strip
-        g_acc = "✅" if mean_acc >= MIN_EDGE else "❌"
-        g_buy = "✅" if (buy_prec >= MIN_EDGE and buy_calls >= MIN_CALLS) else "❌"
-        g_sell = "✅" if (sell_prec >= MIN_EDGE and sell_calls >= MIN_CALLS) else "❌"
+        g_acc = "✅" if mean_acc >= MIN_ACC else "❌"
+        g_ev = "✅" if buy_ev_ok else "❌"
+        g_sell = "✅" if sell_ok else "❌"
+        ev_diag = f"{hist_buy_ev_r:+.2f}R" if hist_buy_ev_r is not None else "N/A"
         st.caption(
-            f"**Guardrail Check (Rows: {len(train_data)} | Purge Gap: {gap}d | Base Win Rate: {base_win_rate:.1%}):** "
-            f"Accuracy ≥55% {g_acc} ({mean_acc:.1%})  |  "
-            f"Buy Prec ≥55% {g_buy} ({buy_prec:.1%}, n={buy_calls})  |  "
+            f"**Guardrail (Rows: {len(train_data)} | Gap: {gap}d | Base Win: {base_win_rate:.1%} | Break-Even: 40.0%):** "
+            f"Acc ≥52% {g_acc} ({mean_acc:.1%})  |  "
+            f"Hist Buy EV ≥+0.10R {g_ev} ({ev_diag}, n={buy_calls})  |  "
             f"Sell Prec ≥55% {g_sell} ({sell_prec:.1%}, n={sell_calls})  |  "
             f"Trend: {trend_now}"
         )
@@ -632,19 +675,69 @@ with tab_deep:
         # ATR Triple-Barrier Levels & Macro Context Strip
         atr_val = float(data["ATR_14"].iloc[-1])
         atr_pct = float(data["ATR_Pct"].iloc[-1] * 100)
-        tp_price = latest_close + 1.5 * atr_val
-        sl_price = max(0.01, latest_close - 1.0 * atr_val)
+        tp_price = latest_close + tp_mult * atr_val
+        sl_price = max(0.01, latest_close - sl_mult * atr_val)
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("14-Day ATR (Volatility)", f"${atr_val:.2f}", f"{atr_pct:.1f}% daily avg")
-        m2.metric("Triple-Barrier Target (+1.5x ATR)", f"${tp_price:.2f}", f"+{(tp_price/latest_close - 1)*100:.1f}%")
-        m3.metric("Triple-Barrier Stop (-1.0x ATR)", f"${sl_price:.2f}", f"{(sl_price/latest_close - 1)*100:.1f}%")
+        m2.metric(f"Profit Target (+{tp_mult:g}x ATR)", f"${tp_price:.2f}", f"+{(tp_price / latest_close - 1) * 100:.1f}%")
+        m3.metric(f"Stop-Loss (-{sl_mult:g}x ATR)", f"${sl_price:.2f}", f"{(sl_price / latest_close - 1) * 100:.1f}%")
         if "VIX_Level" in data.columns and "Rel_Strength_20" in data.columns:
             vix_now = float(data["VIX_Level"].iloc[-1])
             rel_now = float(data["Rel_Strength_20"].iloc[-1] * 100)
             m4.metric("Macro: VIX | vs QQQ (20D)", f"VIX {vix_now:.1f}", f"{rel_now:+.1f}% vs QQQ")
         else:
-            m4.metric("20D Return", f"{float(data['Ret_20'].iloc[-1]*100):+.1f}%")
+            m4.metric("20D Return", f"{float(data['Ret_20'].iloc[-1] * 100):+.1f}%")
+
+        st.divider()
+
+        # Risk-Per-Trade Position Sizer (Volatility-Adjusted)
+        st.subheader("🛡️ Risk-Per-Trade Position Sizer (ATR-Adjusted)")
+        st.caption(
+            f"Sizes a hypothetical **{ticker}** entry using its live **-{sl_mult:g}x ATR stop (${sl_price:.2f})** "
+            "so one stop-out never exceeds your chosen max account risk."
+        )
+
+        sc1, sc2, sc3 = st.columns(3)
+        account_size = sc1.number_input("Portfolio / Account Size ($)", min_value=100.0, value=5000.0, step=500.0)
+        risk_pct = sc2.slider("Max Risk per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
+        allow_fractional = sc3.checkbox("Allow Fractional Shares", value=False)
+
+        risk_budget = account_size * (risk_pct / 100.0)
+        risk_per_share = latest_close - sl_price
+        reward_per_share = tp_price - latest_close
+
+        if risk_per_share > 0:
+            raw_shares = risk_budget / risk_per_share
+            max_cash_shares = account_size / latest_close
+            sized_shares = min(raw_shares, max_cash_shares)
+            if not allow_fractional:
+                sized_shares = float(int(np.floor(sized_shares)))
+
+            pos_cost = sized_shares * latest_close
+            alloc_pct = (pos_cost / account_size) * 100 if account_size > 0 else 0.0
+            actual_risk_usd = sized_shares * risk_per_share
+            target_gain_usd = sized_shares * reward_per_share
+            expected_usd_hist = (
+                (hist_buy_ev_r * actual_risk_usd) if (hist_buy_ev_r is not None and actual_risk_usd > 0) else None
+            )
+
+            r1, r2, r3, r4 = st.columns(4)
+            shares_disp = f"{sized_shares:.2f}" if allow_fractional else f"{int(sized_shares)}"
+            r1.metric("Max Position Size", f"{shares_disp} shares", f"${pos_cost:,.2f} ({alloc_pct:.1f}% of acct)")
+            r2.metric("Risk at Stop (-1R)", f"-${actual_risk_usd:,.2f}", f"Budget: ${risk_budget:,.2f} ({risk_pct:.1f}%)")
+            r3.metric(f"Gain at Target (+{rr_ratio:g}R)", f"+${target_gain_usd:,.2f}", f"Target: ${tp_price:.2f}")
+            r4.metric(
+                "Hist. Expected Value ($)",
+                f"{expected_usd_hist:+,.2f}".replace("+", "+$").replace("-", "-$") if expected_usd_hist is not None else "N/A",
+                "Based on Purged Buy EV"
+            )
+
+            if signal != "BUY 🟢":
+                st.info(
+                    f"Current signal is **{signal}** ({trend_now}) — use these numbers as a pre-trade plan "
+                    "for future entries rather than a trigger to buy today."
+                )
 
         st.divider()
         col_chart, col_rsi = st.columns([2, 1])
