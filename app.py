@@ -7,29 +7,49 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, precision_score
 
 # 1. Page Setup
-st.set_page_config(page_title="Future Project: Quant ML Dashboard", layout="wide")
-st.title("🚀 Future Project: Quant ML & Fundamentals Dashboard")
-st.caption("Two-layer decision engine combining a walk-forward Random Forest with live quarterly financials.")
+st.set_page_config(page_title="Future Project: Quant Screener & ML", layout="wide")
+st.title("🚀 Future Project: Quant Screener & Decision Dashboard")
+st.caption("Stock screener, realistic fundamental scoring, walk-forward ML guardrails, and position recovery tracker.")
 
 # Sidebar Controls
 with st.sidebar:
-    st.header("⚙️ Model Controls")
-    ticker = st.text_input("Stock Ticker", value="PONY").strip().upper()
+    st.header("⚙️ Dashboard Controls")
+    ticker = st.text_input("Deep-Dive Stock Ticker", value="PONY").strip().upper()
+
+    horizon_label = st.selectbox(
+        "ML Prediction Horizon",
+        options=["5 Trading Days (1 Week)", "20 Trading Days (1 Month)", "1 Trading Day (Noisy)"],
+        index=0,
+        help="Multi-day horizons filter out daily noise better than 1-day predictions."
+    )
+    horizon_days = {"5 Trading Days (1 Week)": 5, "20 Trading Days (1 Month)": 20, "1 Trading Day (Noisy)": 1}[horizon_label]
+
     confidence_threshold = st.slider(
         "Min Confidence for BUY / SELL (%)",
-        min_value=50, max_value=75, value=60,
-        help="Signals below this threshold are flagged as HOLD to reduce noise."
-    )
-    st.divider()
-    st.info(
-        "**Note on Fresh Earnings:** Yahoo Finance structured tables can lag "
-        "a few days behind brand-new earnings press releases. Always check the "
-        "quarter-end date displayed on the Financials tab."
+        min_value=55, max_value=75, value=60
     )
 
-# 2. Daily Market Data Pipeline (refreshes every hour in the cloud)
+    st.divider()
+    st.subheader("🔎 Screener Watchlist")
+    watchlist_raw = st.text_area(
+        "Tickers (comma-separated)",
+        value="PONY, QBTS, IONQ, TSLA, NVDA, MSFT, GOOGL, AMD",
+        height=90
+    )
+    watchlist = tuple(dict.fromkeys(
+        t.strip().upper() for t in watchlist_raw.split(",") if t.strip()
+    ))
+
+    st.divider()
+    st.caption(
+        "⚠️ Decision-support tool only—not financial advice. "
+        "Always check backtest reliability and trend regime before acting."
+    )
+
+
+# 2. Data & Fundamental Pipelines
 @st.cache_data(ttl=3600)
-def load_market_data(symbol: str) -> pd.DataFrame:
+def load_market_data(symbol: str, shift_days: int = 5) -> pd.DataFrame:
     data = yf.download(symbol, start="2024-01-01", multi_level_index=False, progress=False)
     if data.empty:
         return data
@@ -37,31 +57,32 @@ def load_market_data(symbol: str) -> pd.DataFrame:
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
 
-    # Moving Averages & Stationary Ratios
     data["SMA_50"] = data["Close"].rolling(window=50).mean()
     data["SMA_200"] = data["Close"].rolling(window=200).mean()
     data["Price_to_SMA50"] = data["Close"] / data["SMA_50"]
     data["SMA_50_to_200"] = data["SMA_50"] / data["SMA_200"]
 
-    # Volume & Volatility
     data["Vol_SMA_20"] = data["Volume"].rolling(window=20).mean()
     data["Volume_Ratio"] = data["Volume"] / data["Vol_SMA_20"]
     data["Daily_Spread"] = (data["High"] - data["Low"]) / data["Close"]
 
-    # 14-Day RSI (Momentum)
+    # 14-Day RSI
     delta = data["Close"].diff()
     gain = delta.clip(lower=0).rolling(window=14).mean()
     loss = (-delta.clip(upper=0)).rolling(window=14).mean()
     rs = gain / loss.replace(0, np.nan)
     data["RSI_14"] = 100 - (100 / (1 + rs))
 
-    # Next-day directional target (1 = up, 0 = down/flat)
-    data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
+    # Drawdown from 52-week (252 trading days) high
+    rolling_high = data["Close"].rolling(window=252, min_periods=50).max()
+    data["Drawdown_Pct"] = ((data["Close"] - rolling_high) / rolling_high) * 100
+
+    # Target: 1 if close N trading days later is higher
+    data["Target"] = (data["Close"].shift(-shift_days) > data["Close"]).astype(int)
     data.dropna(inplace=True)
     return data
 
 
-# 3. Live Quarterly Fundamentals Pipeline
 def _extract_row(df: pd.DataFrame, candidates: list[str], col_idx: int = 0):
     if df is None or df.empty or col_idx >= len(df.columns):
         return None
@@ -76,18 +97,19 @@ def _extract_row(df: pd.DataFrame, candidates: list[str], col_idx: int = 0):
 @st.cache_data(ttl=3600)
 def load_fundamentals(symbol: str) -> dict:
     stock = yf.Ticker(symbol)
-    info = stock.info or {}
+    try:
+        info = stock.info or {}
+    except Exception:
+        info = {}
+
     q_income = stock.quarterly_income_stmt
     q_balance = stock.quarterly_balance_sheet
     q_cashflow = stock.quarterly_cashflow
 
     latest_q = q_income.columns[0].strftime("%Y-%m-%d") if (q_income is not None and not q_income.empty) else "N/A"
-
     rev_now = _extract_row(q_income, ["Total Revenue", "Operating Revenue"], 0)
-    rev_prev = _extract_row(q_income, ["Total Revenue", "Operating Revenue"], 1)
     gross_profit = _extract_row(q_income, ["Gross Profit"], 0)
     op_income = _extract_row(q_income, ["Operating Income", "EBIT"], 0)
-
     cash = _extract_row(
         q_balance,
         ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"],
@@ -99,12 +121,36 @@ def load_fundamentals(symbol: str) -> dict:
         0,
     )
 
-    # Derived financial health metrics
-    qoq_rev_growth = ((rev_now - rev_prev) / abs(rev_prev) * 100) if (rev_now and rev_prev) else None
     gross_margin = (gross_profit / rev_now * 100) if (gross_profit is not None and rev_now) else None
+    op_margin = (op_income / rev_now * 100) if (op_income is not None and rev_now) else None
     runway_quarters = (cash / abs(op_cashflow)) if (cash and op_cashflow and op_cashflow < 0) else None
+    ps_ratio = info.get("priceToSalesTrailing12Months")
+    rev_growth_yoy = info.get("revenueGrowth")
 
-    # Quarterly revenue history for charting
+    # Balanced 4-Pillar Fundamental Score (0-100)
+    # 1. Growth (25) | 2. Profitability (25) | 3. Cash Safety (25) | 4. Valuation Discipline (25)
+    pts, max_pts = 0, 0
+    if rev_growth_yoy is not None:
+        max_pts += 25
+        pts += 25 if rev_growth_yoy > 0.25 else 15 if rev_growth_yoy > 0.10 else 8 if rev_growth_yoy > 0 else 0
+
+    if op_margin is not None:
+        max_pts += 25
+        pts += 25 if op_margin >= 15 else 15 if op_margin > 0 else 5 if op_margin > -30 else 0
+
+    if op_cashflow is not None:
+        max_pts += 25
+        if op_cashflow > 0:
+            pts += 25
+        elif runway_quarters is not None:
+            pts += 20 if runway_quarters >= 12 else 14 if runway_quarters >= 8 else 7 if runway_quarters >= 4 else 0
+
+    if ps_ratio is not None and ps_ratio > 0:
+        max_pts += 25
+        pts += 25 if ps_ratio < 5 else 18 if ps_ratio < 15 else 10 if ps_ratio < 30 else 0
+
+    fund_score = round((pts / max_pts) * 100) if max_pts > 0 else None
+
     rev_series = None
     if q_income is not None and not q_income.empty:
         for label in ["Total Revenue", "Operating Revenue"]:
@@ -118,17 +164,28 @@ def load_fundamentals(symbol: str) -> dict:
         "name": info.get("shortName", symbol),
         "market_cap": info.get("marketCap"),
         "target_mean": info.get("targetMeanPrice"),
-        "rev_growth_yoy": info.get("revenueGrowth"),
+        "ps_ratio": ps_ratio,
+        "rev_growth_yoy": rev_growth_yoy,
         "latest_q": latest_q,
         "rev_now": rev_now,
-        "qoq_rev_growth": qoq_rev_growth,
         "gross_margin": gross_margin,
-        "op_income": op_income,
+        "op_margin": op_margin,
         "cash": cash,
         "op_cashflow": op_cashflow,
         "runway_quarters": runway_quarters,
+        "fund_score": fund_score,
         "rev_series": rev_series,
     }
+
+
+def classify_trend(close: float, sma50: float, sma200: float) -> str:
+    if close > sma50 and sma50 > sma200:
+        return "🟢 Uptrend"
+    if close > sma50 and sma50 <= sma200:
+        return "🟡 Recovery Watch"
+    if close <= sma50 and sma50 > sma200:
+        return "🟠 Pullback"
+    return "🔴 Downtrend"
 
 
 def fmt_money(val) -> str:
@@ -143,153 +200,270 @@ def fmt_money(val) -> str:
     return f"{sign}${abs_val:,.0f}"
 
 
-# Load Data
-if not ticker:
-    st.warning("Enter a stock ticker in the sidebar to begin.")
-    st.stop()
+@st.cache_data(ttl=3600)
+def build_screener_table(tickers: tuple[str, ...]) -> pd.DataFrame:
+    rows = []
+    for sym in tickers:
+        try:
+            df = load_market_data(sym, shift_days=5)
+            if df.empty or len(df) < 10:
+                continue
+            f = load_fundamentals(sym)
+            close = float(df["Close"].iloc[-1])
+            prev = float(df["Close"].iloc[-2])
+            sma50 = float(df["SMA_50"].iloc[-1])
+            sma200 = float(df["SMA_200"].iloc[-1])
+            rsi = float(df["RSI_14"].iloc[-1])
+            dd = float(df["Drawdown_Pct"].iloc[-1])
+            trend = classify_trend(close, sma50, sma200)
 
-data = load_market_data(ticker)
-if data.empty or len(data) < 30:
-    st.error(f"Not enough historical price data for '{ticker}' (needs >200 trading days for SMA_200).")
-    st.stop()
+            # Actionable screening status
+            score = f["fund_score"] if f["fund_score"] is not None else 0
+            if trend == "🟢 Uptrend" and score >= 60 and rsi < 70:
+                verdict = "✅ Strong Candidate"
+            elif trend == "🟡 Recovery Watch" and score >= 50:
+                verdict = "👀 Early Turnaround"
+            elif trend == "🔴 Downtrend":
+                verdict = "🛑 Falling Knife / Wait"
+            elif rsi >= 70:
+                verdict = "🔥 Overbought"
+            else:
+                verdict = "⚖️ Neutral / Watch"
 
-fund = load_fundamentals(ticker)
-st.subheader(f"{fund['name']} ({ticker})")
+            rows.append({
+                "Ticker": sym,
+                "Price ($)": round(close, 2),
+                "1D %": round(((close - prev) / prev) * 100, 2),
+                "Trend Regime": trend,
+                "vs SMA50 %": round(((close - sma50) / sma50) * 100, 1),
+                "RSI (14)": round(rsi, 1),
+                "From 52W High %": round(dd, 1),
+                "Fund Score": f["fund_score"],
+                "P/S Ratio": round(f["ps_ratio"], 1) if f["ps_ratio"] else np.nan,
+                "Op Margin %": round(f["op_margin"], 1) if f["op_margin"] is not None else np.nan,
+                "Screener Verdict": verdict,
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
 
-# 4. Walk-Forward Backtest & Live Prediction
-features = ["Price_to_SMA50", "SMA_50_to_200", "Volume_Ratio", "Daily_Spread", "RSI_14"]
-train_data = data.iloc[:-1]
-X_train = train_data[features]
-y_train = train_data["Target"]
 
-n_splits = min(5, max(2, len(train_data) // 40))
-tscv = TimeSeriesSplit(n_splits=n_splits)
-accs, precs = [], []
-
-for tr_idx, te_idx in tscv.split(X_train):
-    bt_model = RandomForestClassifier(
-        n_estimators=150, max_depth=6, min_samples_leaf=5,
-        random_state=42, class_weight="balanced"
-    )
-    bt_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
-    preds = bt_model.predict(X_train.iloc[te_idx])
-    accs.append(accuracy_score(y_train.iloc[te_idx], preds))
-    precs.append(precision_score(y_train.iloc[te_idx], preds, zero_division=0))
-
-# Train final model on all completed days
-model = RandomForestClassifier(
-    n_estimators=150, max_depth=6, min_samples_leaf=5,
-    random_state=42, class_weight="balanced"
-)
-model.fit(X_train, y_train)
-
-latest_features = data[features].iloc[[-1]]
-probs = model.predict_proba(latest_features)[0]
-prob_up = probs[1] * 100
-prob_down = probs[0] * 100
-confidence = max(prob_up, prob_down)
-
-if prob_up >= confidence_threshold:
-    signal = "BUY 🟢"
-elif prob_down >= confidence_threshold:
-    signal = "SELL 🔴"
-else:
-    signal = "HOLD 🟡"
-
-# 5. Fundamental Health Score (0-100)
-fund_points, fund_max = 0, 0
-if fund["rev_growth_yoy"] is not None:
-    fund_max += 35
-    if fund["rev_growth_yoy"] > 0.25:
-        fund_points += 35
-    elif fund["rev_growth_yoy"] > 0:
-        fund_points += 20
-if fund["runway_quarters"] is not None:
-    fund_max += 35
-    if fund["runway_quarters"] >= 8:
-        fund_points += 35
-    elif fund["runway_quarters"] >= 4:
-        fund_points += 20
-elif fund["op_cashflow"] is not None and fund["op_cashflow"] > 0:
-    fund_max += 35
-    fund_points += 35  # Cash-flow positive
-if fund["gross_margin"] is not None:
-    fund_max += 30
-    if fund["gross_margin"] >= 40:
-        fund_points += 30
-    elif fund["gross_margin"] >= 15:
-        fund_points += 18
-
-fund_score = round((fund_points / fund_max) * 100) if fund_max > 0 else None
-
-# 6. Top KPI Strip
-latest_close = float(data["Close"].iloc[-1])
-prev_close = float(data["Close"].iloc[-2])
-day_pct = ((latest_close - prev_close) / prev_close) * 100
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Current Price", f"${latest_close:.2f}", f"{day_pct:+.2f}%")
-c2.metric("ML Signal", signal)
-c3.metric("Model Confidence", f"{confidence:.1f}%", f"Min: {confidence_threshold}%")
-c4.metric("Backtest Accuracy", f"{np.mean(accs):.1%}", f"Buy Prec: {np.mean(precs):.1%}")
-c5.metric(
-    "Fundamental Score",
-    f"{fund_score}/100" if fund_score is not None else "N/A",
-    f"Q-End: {fund['latest_q']}"
-)
-
-st.divider()
-
-# 7. Tabbed Workspace
-tab_tech, tab_fund, tab_model = st.tabs([
-    "📈 Technicals & Signals",
-    "💰 Live Financials & Runway",
-    "🧠 Feature Importance & Data"
+# 3. Main Workspace Tabs
+tab_screener, tab_positions, tab_deep, tab_fund = st.tabs([
+    "🔎 Stock Screener",
+    "💼 My Positions & Break-Even",
+    "📈 Deep-Dive ML & Technicals",
+    "💰 Live Financials & Runway"
 ])
 
-with tab_tech:
-    col_chart, col_rsi = st.columns([2, 1])
-    with col_chart:
-        st.subheader("Price Action vs. Moving Averages")
-        st.line_chart(data[["Close", "SMA_50", "SMA_200"]])
-    with col_rsi:
-        st.subheader("14-Day RSI (Momentum)")
-        st.line_chart(data[["RSI_14"]])
-        latest_rsi = float(data["RSI_14"].iloc[-1])
-        rsi_state = "Oversold (<30)" if latest_rsi < 30 else "Overbought (>70)" if latest_rsi > 70 else "Neutral (30–70)"
-        st.caption(f"Latest RSI: **{latest_rsi:.1f}** — {rsi_state}")
+# --- TAB 1: STOCK SCREENER ---
+with tab_screener:
+    st.subheader("Watchlist Stock Screener")
+    st.caption("Compare your holdings against peers and quality leaders using trend, momentum, profitability, and valuation.")
 
+    with st.spinner("Scanning watchlist..."):
+        screen_df = build_screener_table(watchlist)
+
+    if screen_df.empty:
+        st.warning("No valid tickers found in the watchlist.")
+    else:
+        fc1, fc2, fc3 = st.columns(3)
+        min_score = fc1.slider("Min Fundamental Score", 0, 100, 0, step=5)
+        max_rsi = fc2.slider("Max RSI (Avoid Overbought)", 30, 100, 100)
+        trend_filter = fc3.multiselect(
+            "Filter by Trend Regime",
+            options=["🟢 Uptrend", "🟡 Recovery Watch", "🟠 Pullback", "🔴 Downtrend"],
+            default=["🟢 Uptrend", "🟡 Recovery Watch", "🟠 Pullback", "🔴 Downtrend"]
+        )
+
+        filtered = screen_df[
+            (screen_df["Fund Score"].fillna(0) >= min_score) &
+            (screen_df["RSI (14)"] <= max_rsi) &
+            (screen_df["Trend Regime"].isin(trend_filter))
+        ].sort_values(by="Fund Score", ascending=False)
+
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+        st.info(
+            "**How to read this:** A stock marked **🛑 Falling Knife / Wait** (`Price < SMA_50 < SMA_200`) "
+            "has not yet proven it has bottomed. Waiting for **🟡 Recovery Watch** (reclaiming `SMA_50`) "
+            "or focusing new buys on **✅ Strong Candidate** stocks reduces the risk of getting stuck."
+        )
+
+# --- TAB 2: MY POSITIONS & BREAK-EVEN ---
+with tab_positions:
+    st.subheader("Position & Recovery Calculator (Private to Your Session)")
+    st.caption("Edit your average buy price and share count below—nothing entered here is saved to GitHub.")
+
+    default_positions = pd.DataFrame([
+        {"Ticker": "PONY", "Avg Buy Price ($)": 10.00, "Shares": 100.0},
+        {"Ticker": "QBTS", "Avg Buy Price ($)": 15.00, "Shares": 100.0},
+    ])
+
+    edited_pos = st.data_editor(
+        default_positions,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True
+    )
+
+    pos_rows = []
+    total_cost, total_val = 0.0, 0.0
+    for _, row in edited_pos.iterrows():
+        sym = str(row["Ticker"]).strip().upper()
+        buy_p = float(row["Avg Buy Price ($)"] or 0)
+        shares = float(row["Shares"] or 0)
+        if not sym or buy_p <= 0 or shares <= 0:
+            continue
+
+        df_p = load_market_data(sym, shift_days=5)
+        if df_p.empty:
+            continue
+
+        curr_p = float(df_p["Close"].iloc[-1])
+        sma50 = float(df_p["SMA_50"].iloc[-1])
+        sma200 = float(df_p["SMA_200"].iloc[-1])
+
+        cost = buy_p * shares
+        val = curr_p * shares
+        pnl = val - cost
+        pnl_pct = ((curr_p - buy_p) / buy_p) * 100
+        gain_to_even = max(0.0, ((buy_p - curr_p) / curr_p) * 100)
+        dist_sma50 = ((sma50 - curr_p) / curr_p) * 100
+
+        total_cost += cost
+        total_val += val
+
+        pos_rows.append({
+            "Ticker": sym,
+            "Current ($)": round(curr_p, 2),
+            "Avg Cost ($)": round(buy_p, 2),
+            "Value ($)": round(val, 2),
+            "P&L ($)": round(pnl, 2),
+            "P&L (%)": round(pnl_pct, 1),
+            "% Gain to Break Even": round(gain_to_even, 1),
+            "SMA50 Reclaim Target ($)": round(sma50, 2),
+            "% to Reclaim SMA50": round(dist_sma50, 1),
+            "Trend Regime": classify_trend(curr_p, sma50, sma200),
+        })
+
+    if pos_rows:
+        p1, p2, p3 = st.columns(3)
+        tot_pnl = total_val - total_cost
+        tot_pct = (tot_pnl / total_cost * 100) if total_cost > 0 else 0
+        p1.metric("Total Invested", f"${total_cost:,.2f}")
+        p2.metric("Current Value", f"${total_val:,.2f}")
+        p3.metric("Total Unrealized P&L", f"${tot_pnl:,.2f}", f"{tot_pct:+.1f}%")
+        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+
+# --- LOAD DEEP-DIVE TICKER FOR TABS 3 & 4 ---
+data = load_market_data(ticker, shift_days=horizon_days) if ticker else pd.DataFrame()
+fund = load_fundamentals(ticker) if ticker else {}
+
+# --- TAB 3: DEEP-DIVE ML & TECHNICALS ---
+with tab_deep:
+    if data.empty or len(data) < 35:
+        st.error(f"Not enough historical price data for '{ticker}' (needs >200 trading days for SMA_200).")
+    else:
+        st.subheader(f"{fund['name']} ({ticker}) — {horizon_label} Model")
+
+        features = ["Price_to_SMA50", "SMA_50_to_200", "Volume_Ratio", "Daily_Spread", "RSI_14"]
+        train_data = data.iloc[:-horizon_days]
+        X_train = train_data[features]
+        y_train = train_data["Target"]
+
+        n_splits = min(5, max(2, len(train_data) // 40))
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        accs, precs = [], []
+
+        for tr_idx, te_idx in tscv.split(X_train):
+            bt_model = RandomForestClassifier(
+                n_estimators=150, max_depth=6, min_samples_leaf=5,
+                random_state=42, class_weight="balanced"
+            )
+            bt_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+            preds = bt_model.predict(X_train.iloc[te_idx])
+            accs.append(accuracy_score(y_train.iloc[te_idx], preds))
+            precs.append(precision_score(y_train.iloc[te_idx], preds, zero_division=0))
+
+        mean_acc = float(np.mean(accs))
+        mean_prec = float(np.mean(precs))
+
+        model = RandomForestClassifier(
+            n_estimators=150, max_depth=6, min_samples_leaf=5,
+            random_state=42, class_weight="balanced"
+        )
+        model.fit(X_train, y_train)
+
+        latest_features = data[features].iloc[[-1]]
+        probs = model.predict_proba(latest_features)[0]
+        prob_up = probs[1] * 100
+        prob_down = probs[0] * 100
+        confidence = max(prob_up, prob_down)
+
+        # Reliability Guardrail: block BUY/SELL if backtest < 52%
+        if mean_acc < 0.52:
+            signal = "⚠️ LOW EDGE"
+        elif prob_up >= confidence_threshold:
+            signal = "BUY 🟢"
+        elif prob_down >= confidence_threshold:
+            signal = "SELL 🔴"
+        else:
+            signal = "HOLD 🟡"
+
+        latest_close = float(data["Close"].iloc[-1])
+        prev_close = float(data["Close"].iloc[-2])
+        day_pct = ((latest_close - prev_close) / prev_close) * 100
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Current Price", f"${latest_close:.2f}", f"{day_pct:+.2f}%")
+        c2.metric("ML Signal", signal)
+        c3.metric("Model Confidence", f"{confidence:.1f}%", f"Min: {confidence_threshold}%")
+        c4.metric("Backtest Accuracy", f"{mean_acc:.1%}", f"Buy Prec: {mean_prec:.1%}")
+        c5.metric(
+            "Fundamental Score",
+            f"{fund['fund_score']}/100" if fund["fund_score"] is not None else "N/A",
+            f"Q-End: {fund['latest_q']}"
+        )
+
+        if mean_acc < 0.52:
+            st.warning(
+                f"Walk-forward backtest accuracy for **{ticker}** is **{mean_acc:.1%}** (below the 52% reliability floor). "
+                "The ML signal is intentionally muted—rely on the Trend Regime and Financials tab instead."
+            )
+
+        st.divider()
+        col_chart, col_rsi = st.columns([2, 1])
+        with col_chart:
+            st.subheader("Price Action vs. Moving Averages")
+            st.line_chart(data[["Close", "SMA_50", "SMA_200"]])
+        with col_rsi:
+            st.subheader("14-Day RSI (Momentum)")
+            st.line_chart(data[["RSI_14"]])
+            latest_rsi = float(data["RSI_14"].iloc[-1])
+            rsi_state = "Oversold (<30)" if latest_rsi < 30 else "Overbought (>70)" if latest_rsi > 70 else "Neutral (30–70)"
+            st.caption(f"Latest RSI: **{latest_rsi:.1f}** — {rsi_state}")
+
+# --- TAB 4: LIVE FINANCIALS & RUNWAY ---
 with tab_fund:
-    st.caption(f"Latest structured filing available via Yahoo Finance: **{fund['latest_q']}**")
-    f1, f2, f3, f4 = st.columns(4)
-    yoy_str = f"{fund['rev_growth_yoy'] * 100:+.1f}% YoY" if fund["rev_growth_yoy"] is not None else None
-    f1.metric("Quarterly Revenue", fmt_money(fund["rev_now"]), yoy_str)
-    f2.metric("Cash & Short-Term Inv.", fmt_money(fund["cash"]))
-
-    if fund["runway_quarters"] is not None:
-        f3.metric("Est. Cash Runway", f"{fund['runway_quarters']:.1f} Qtrs", f"Burn: {fmt_money(fund['op_cashflow'])}/Q")
+    if not fund:
+        st.warning("Enter a valid ticker in the sidebar.")
     else:
-        f3.metric("Operating Cash Flow", fmt_money(fund["op_cashflow"]))
+        st.subheader(f"{fund['name']} ({ticker}) — Fundamental Reality Check")
+        st.caption(f"Latest structured filing via Yahoo Finance: **{fund['latest_q']}**")
 
-    if fund["target_mean"] is not None:
-        upside = ((fund["target_mean"] - latest_close) / latest_close) * 100
-        f4.metric("Analyst Mean Target", f"${fund['target_mean']:.2f}", f"{upside:+.1f}% vs. price")
-    else:
-        f4.metric("Market Cap", fmt_money(fund["market_cap"]))
+        f1, f2, f3, f4, f5 = st.columns(5)
+        yoy_str = f"{fund['rev_growth_yoy'] * 100:+.1f}% YoY" if fund["rev_growth_yoy"] is not None else None
+        f1.metric("Quarterly Revenue", fmt_money(fund["rev_now"]), yoy_str)
+        f2.metric("Operating Margin", f"{fund['op_margin']:.1f}%" if fund["op_margin"] is not None else "N/A")
+        f3.metric("Price / Sales", f"{fund['ps_ratio']:.1f}x" if fund["ps_ratio"] else "N/A")
+        f4.metric("Cash & Short-Term Inv.", fmt_money(fund["cash"]))
 
-    if fund["rev_series"] is not None and not fund["rev_series"].empty:
-        st.subheader("Quarterly Revenue Trajectory ($ Millions)")
-        st.bar_chart(fund["rev_series"])
+        if fund["runway_quarters"] is not None:
+            f5.metric("Est. Cash Runway", f"{fund['runway_quarters']:.1f} Qtrs", f"Burn: {fmt_money(fund['op_cashflow'])}/Q")
+        else:
+            f5.metric("Operating Cash Flow", fmt_money(fund["op_cashflow"]))
 
-with tab_model:
-    col_imp, col_mat = st.columns([1, 2])
-    with col_imp:
-        st.subheader("Random Forest Feature Weights")
-        imp_df = pd.DataFrame({
-            "Feature": features,
-            "Importance": model.feature_importances_
-        }).sort_values("Importance", ascending=False).set_index("Feature")
-        st.bar_chart(imp_df)
-    with col_mat:
-        st.subheader("Recent Feature Matrix (Last 7 Days)")
-        st.dataframe(data[features].tail(7).round(4), use_container_width=True)
+        if fund["rev_series"] is not None and not fund["rev_series"].empty:
+            st.subheader("Quarterly Revenue Trajectory ($ Millions)")
+            st.bar_chart(fund["rev_series"])
