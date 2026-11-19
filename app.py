@@ -9,7 +9,7 @@ from sklearn.metrics import accuracy_score, precision_score
 # 1. Page Setup
 st.set_page_config(page_title="Future Project: Quant Screener & ML", layout="wide")
 st.title("🚀 Future Project: Quant Screener & Decision Dashboard")
-st.caption("Stock screener, realistic fundamental scoring, walk-forward ML guardrails, and position recovery tracker.")
+st.caption("Stock screener, realistic fundamental scoring, purged walk-forward ML guardrails, and position tracker.")
 
 # Sidebar Controls
 with st.sidebar:
@@ -73,7 +73,7 @@ def load_market_data(symbol: str, shift_days: int = 5) -> pd.DataFrame:
     rs = gain / loss.replace(0, np.nan)
     data["RSI_14"] = 100 - (100 / (1 + rs))
 
-    # Drawdown from 52-week (252 trading days) high
+    # Drawdown from 52-week high
     rolling_high = data["Close"].rolling(window=252, min_periods=50).max()
     data["Drawdown_Pct"] = ((data["Close"] - rolling_high) / rolling_high) * 100
 
@@ -128,7 +128,6 @@ def load_fundamentals(symbol: str) -> dict:
     rev_growth_yoy = info.get("revenueGrowth")
 
     # Balanced 4-Pillar Fundamental Score (0-100)
-    # 1. Growth (25) | 2. Profitability (25) | 3. Cash Safety (25) | 4. Valuation Discipline (25)
     pts, max_pts = 0, 0
     if rev_growth_yoy is not None:
         max_pts += 25
@@ -217,7 +216,6 @@ def build_screener_table(tickers: tuple[str, ...]) -> pd.DataFrame:
             dd = float(df["Drawdown_Pct"].iloc[-1])
             trend = classify_trend(close, sma50, sma200)
 
-            # Actionable screening status
             score = f["fund_score"] if f["fund_score"] is not None else 0
             if trend == "🟢 Uptrend" and score >= 60 and rsi < 70:
                 verdict = "✅ Strong Candidate"
@@ -372,25 +370,38 @@ with tab_deep:
         X_train = train_data[features]
         y_train = train_data["Target"]
 
-        n_splits = min(5, max(2, len(train_data) // 40))
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        accs, precs = [], []
+        # Safe purged TimeSeriesSplit (prevents overlapping multi-day target leakage)
+        n_splits = 5
+        gap = horizon_days
+        while n_splits > 2:
+            test_size = len(train_data) // (n_splits + 1)
+            first_train = len(train_data) - n_splits * test_size - gap
+            if first_train >= 30 and test_size >= 15:
+                break
+            n_splits -= 1
+
+        if len(train_data) - n_splits * (len(train_data) // (n_splits + 1)) - gap < 15:
+            gap = 0
+
+        tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap)
+        all_y_true, all_y_pred = [], []
 
         for tr_idx, te_idx in tscv.split(X_train):
             bt_model = RandomForestClassifier(
-                n_estimators=150, max_depth=6, min_samples_leaf=5,
+                n_estimators=150, max_depth=5, min_samples_leaf=8,
                 random_state=42, class_weight="balanced"
             )
             bt_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
             preds = bt_model.predict(X_train.iloc[te_idx])
-            accs.append(accuracy_score(y_train.iloc[te_idx], preds))
-            precs.append(precision_score(y_train.iloc[te_idx], preds, zero_division=0))
+            all_y_true.extend(y_train.iloc[te_idx].tolist())
+            all_y_pred.extend(preds.tolist())
 
-        mean_acc = float(np.mean(accs))
-        mean_prec = float(np.mean(precs))
+        mean_acc = float(accuracy_score(all_y_true, all_y_pred))
+        buy_prec = float(precision_score(all_y_true, all_y_pred, pos_label=1, zero_division=0))
+        sell_prec = float(precision_score(all_y_true, all_y_pred, pos_label=0, zero_division=0))
 
         model = RandomForestClassifier(
-            n_estimators=150, max_depth=6, min_samples_leaf=5,
+            n_estimators=150, max_depth=5, min_samples_leaf=8,
             random_state=42, class_weight="balanced"
         )
         model.fit(X_train, y_train)
@@ -401,36 +412,67 @@ with tab_deep:
         prob_down = probs[0] * 100
         confidence = max(prob_up, prob_down)
 
-        # Reliability Guardrail: block BUY/SELL if backtest < 52%
-        if mean_acc < 0.52:
-            signal = "⚠️ LOW EDGE"
-        elif prob_up >= confidence_threshold:
-            signal = "BUY 🟢"
-        elif prob_down >= confidence_threshold:
-            signal = "SELL 🔴"
-        else:
-            signal = "HOLD 🟡"
-
         latest_close = float(data["Close"].iloc[-1])
         prev_close = float(data["Close"].iloc[-2])
         day_pct = ((latest_close - prev_close) / prev_close) * 100
+        trend_now = classify_trend(latest_close, float(data["SMA_50"].iloc[-1]), float(data["SMA_200"].iloc[-1]))
+
+        # Tightened Guardrails: 55% Accuracy + 55% Directional Precision + Trend Alignment
+        MIN_EDGE = 0.55
+        guardrail_reason = None
+
+        if prob_up >= confidence_threshold:
+            if mean_acc < MIN_EDGE or buy_prec < MIN_EDGE:
+                signal = "⚠️ BLOCKED (LOW EDGE)"
+                guardrail_reason = (
+                    f"Raw model leaned BUY ({prob_up:.1f}%), but failed the 55% reliability floor "
+                    f"(Purged Accuracy: **{mean_acc:.1%}**, Buy Precision: **{buy_prec:.1%}**)."
+                )
+            elif trend_now == "🔴 Downtrend":
+                signal = "⚠️ RISKY BOUNCE"
+                guardrail_reason = (
+                    f"Model passed backtest checks, but **{ticker}** is still in a **🔴 Downtrend** "
+                    "(Price < SMA_50 < SMA_200). Wait for an SMA_50 reclaim before treating as a clean BUY."
+                )
+            else:
+                signal = "BUY 🟢"
+        elif prob_down >= confidence_threshold:
+            if mean_acc < MIN_EDGE or sell_prec < MIN_EDGE:
+                signal = "⚠️ BLOCKED (LOW EDGE)"
+                guardrail_reason = (
+                    f"Raw model leaned SELL ({prob_down:.1f}%), but failed the 55% reliability floor "
+                    f"(Purged Accuracy: **{mean_acc:.1%}**, Sell Precision: **{sell_prec:.1%}**)."
+                )
+            else:
+                signal = "SELL 🔴"
+        else:
+            signal = "HOLD 🟡"
 
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Current Price", f"${latest_close:.2f}", f"{day_pct:+.2f}%")
         c2.metric("ML Signal", signal)
         c3.metric("Model Confidence", f"{confidence:.1f}%", f"Min: {confidence_threshold}%")
-        c4.metric("Backtest Accuracy", f"{mean_acc:.1%}", f"Buy Prec: {mean_prec:.1%}")
+        c4.metric("Purged Accuracy", f"{mean_acc:.1%}", f"Buy: {buy_prec:.1%} | Sell: {sell_prec:.1%}")
         c5.metric(
             "Fundamental Score",
             f"{fund['fund_score']}/100" if fund["fund_score"] is not None else "N/A",
             f"Q-End: {fund['latest_q']}"
         )
 
-        if mean_acc < 0.52:
-            st.warning(
-                f"Walk-forward backtest accuracy for **{ticker}** is **{mean_acc:.1%}** (below the 52% reliability floor). "
-                "The ML signal is intentionally muted—rely on the Trend Regime and Financials tab instead."
-            )
+        # Guardrail Checklist Strip
+        g_acc = "✅" if mean_acc >= MIN_EDGE else "❌"
+        g_buy = "✅" if buy_prec >= MIN_EDGE else "❌"
+        g_sell = "✅" if sell_prec >= MIN_EDGE else "❌"
+        st.caption(
+            f"**Guardrail Check (Purge Gap: {gap}d):** "
+            f"Accuracy ≥55% {g_acc} ({mean_acc:.1%})  |  "
+            f"Buy Prec ≥55% {g_buy} ({buy_prec:.1%})  |  "
+            f"Sell Prec ≥55% {g_sell} ({sell_prec:.1%})  |  "
+            f"Trend: {trend_now}"
+        )
+
+        if guardrail_reason:
+            st.warning(guardrail_reason)
 
         st.divider()
         col_chart, col_rsi = st.columns([2, 1])
